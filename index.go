@@ -2,27 +2,97 @@ package search_index_group
 
 import (
 	"context"
+	"fmt"
+	"github.com/go-resty/resty/v2"
+	"github.com/spf13/viper"
 	"google.golang.org/api/indexing/v3"
 	"google.golang.org/api/option"
+	"net/url"
+	"os"
+	"time"
 )
 
 func NewSearchIndex() (*SearchIndex, error) {
 	ctx := context.Background()
-	service, err := indexing.NewService(ctx, option.WithCredentialsJSON([]byte("")))
+
+	gTokenFile := viper.GetString("token.google.searchFile")
+	gToken, err := os.ReadFile(gTokenFile)
+	if err != nil {
+		return nil, err
+	}
+	service, err := indexing.NewService(ctx, option.WithCredentialsJSON(gToken))
 	if err != nil {
 		return nil, err
 	}
 	return &SearchIndex{
 		googleSearchIndex: service,
+		restyClient:       resty.New(),
+		bingApiHost:       "https://ssl.bing.com",
+		bingApiKey:        viper.GetString("token.bing.apiKey"),
 	}, nil
 }
 
 type SearchIndex struct {
 	googleSearchIndex *indexing.Service
+
+	restyClient *resty.Client
+
+	bingApiHost string
+	bingApiKey  string
 }
 
-func (s *SearchIndex) PublishUrl(url string) (*UrlNotification, error) {
-	return nil, nil
+type Platform int
+
+const (
+	Google Platform = iota
+	Bing
+)
+
+type UpdateIndexResult struct {
+	Notification *UrlNotification
+	Error        error
+}
+
+func (s *SearchIndex) PublishUrl(uri string) []*UpdateIndexResult {
+	var result []*UpdateIndexResult
+	if s.googleSearchIndex != nil {
+		notification, err := s.googleUpdateIndex(uri)
+		result = append(result, &UpdateIndexResult{
+			Notification: notification,
+			Error:        err,
+		})
+	}
+	if len(s.bingApiKey) > 0 {
+		notification, err := s.bingUpdateIndex(uri)
+		result = append(result, &UpdateIndexResult{
+			Notification: notification,
+			Error:        err,
+		})
+	}
+	return result
+}
+
+func (s *SearchIndex) googleUpdateIndex(uri string) (*UrlNotification, error) {
+	updateTime := time.Now().Format(time.RFC3339)
+	reqNotification := &indexing.UrlNotification{
+		Url:        uri,
+		NotifyTime: updateTime,
+		Type:       "URL_UPDATED",
+	}
+	publish := s.googleSearchIndex.UrlNotifications.Publish(reqNotification)
+	rsp, err := publish.Do()
+	if err != nil {
+		return nil, err
+	}
+	rspNotification := &UrlNotification{
+		Url:            uri,
+		NotifyTime:     updateTime,
+		Type:           "URL_UPDATED",
+		HTTPStatusCode: rsp.HTTPStatusCode,
+		Platform:       Google,
+	}
+
+	return rspNotification, nil
 }
 
 type UrlNotification struct {
@@ -43,19 +113,33 @@ type UrlNotification struct {
 	// notifications, it _must_ be crawlable by Google.
 	Url string `json:"url,omitempty"`
 
-	// ForceSendFields is a list of field names (e.g. "NotifyTime") to
-	// unconditionally include in API requests. By default, fields with
-	// empty or default values are omitted from API requests. However, any
-	// non-pointer, non-interface field appearing in ForceSendFields will be
-	// sent to the server regardless of whether the field is empty or not.
-	// This may be used to include empty fields in Patch requests.
-	ForceSendFields []string `json:"-"`
+	HTTPStatusCode int `json:"http_status_code"`
 
-	// NullFields is a list of field names (e.g. "NotifyTime") to include in
-	// API requests with the JSON null value. By default, fields with empty
-	// values are omitted from API requests. However, any field with an
-	// empty value appearing in NullFields will be sent to the server as
-	// null. It is an error if a field in this list has a non-empty value.
-	// This may be used to include null fields in Patch requests.
-	NullFields []string `json:"-"`
+	Platform Platform `json:"platform"`
+}
+
+func (s *SearchIndex) bingUpdateIndex(uri string) (*UrlNotification, error) {
+	tmpUrl, _ := url.Parse(uri)
+	body := map[string]string{
+		"siteUrl": fmt.Sprintf("%s://%s", tmpUrl.Scheme, tmpUrl.Host),
+		"url":     uri,
+	}
+	rsp, err := s.restyClient.
+		SetBaseURL(s.bingApiHost).
+		R().
+		SetHeader("Content-Type", "application/json").
+		SetQueryParams(map[string]string{"apikey": s.bingApiKey}).
+		SetBody(body).
+		Post("/webmaster/api.svc/json/SubmitUrl")
+	if err != nil {
+		return nil, err
+	}
+	tmp := &UrlNotification{
+		HTTPStatusCode: rsp.StatusCode(),
+		Url:            uri,
+		Type:           "URL_UPDATED",
+		NotifyTime:     time.Now().String(),
+		Platform:       Bing,
+	}
+	return tmp, nil
 }
